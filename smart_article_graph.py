@@ -4,13 +4,17 @@ import streamlit as st
 import networkx as nx
 from pyvis.network import Network
 import google.generativeai as genai
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Suppress gRPC warnings
 os.environ['GRPC_VERBOSITY'] = 'ERROR'
 os.environ['GLOG_minloglevel'] = '2'
 
 # Initialize Gemini
-genai.configure(api_key="AIzaSyBNI53y5LjGOLtDm3yXjIna8hK-rL82Gxg")
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-2.0-flash-exp')
 
 
