@@ -69,6 +69,8 @@ Be comprehensive but accurate. Only include entities and relationships explicitl
 
         return result
     except Exception as e:
+        # Log the error for debugging
+        st.error(f"Entity extraction error: {str(e)}")
         # Return empty structure if parsing fails
         return {"entities": [], "relationships": []}
 
@@ -99,6 +101,32 @@ def split_into_chunks(article_text, num_chunks=5):
             chunks.append(chunk.strip())
 
     return chunks
+
+
+def find_entity_context(entity_name, articles):
+    """Find paragraphs containing the entity and surrounding context"""
+    contexts = []
+
+    for article_idx, article in enumerate(articles):
+        paragraphs = split_into_paragraphs(article)
+
+        for i, paragraph in enumerate(paragraphs):
+            if entity_name.lower() in paragraph.lower():
+                # Get context: previous paragraph + current + next paragraph
+                context_parts = []
+                if i > 0:
+                    context_parts.append(paragraphs[i-1])
+                context_parts.append(paragraph)
+                if i < len(paragraphs) - 1:
+                    context_parts.append(paragraphs[i+1])
+
+                context = " ".join(context_parts)
+                contexts.append({
+                    "article_idx": article_idx + 1,
+                    "context": context
+                })
+
+    return contexts
 
 
 def find_cross_article_connections(all_entities, articles):
@@ -440,61 +468,70 @@ if extract_button and st.session_state.articles:
                 # Update graph with cross-article connections
                 graph = build_graph(cross_connections, graph)
 
-        # PASS 3: Final validation - ensure isolated entities get connected
+        # PASS 3: Final validation - ensure isolated entities get connected using context
         if graph and graph.number_of_nodes() > 0:
-            status_text.text(f"🤖 Pass 3: Validating all entities are connected...")
+            status_text.text(f"🤖 Pass 3: Connecting isolated entities using context analysis...")
             progress_bar.progress((len(st.session_state.articles) + 1) / (len(st.session_state.articles) + 2))
 
             # Find isolated nodes (entities with no connections)
             isolated_nodes = [node for node in graph.nodes() if graph.degree(node) == 0]
 
-            if isolated_nodes and len(isolated_nodes) < len(all_data["entities"]):
-                # Try to connect isolated nodes
-                connected_nodes = [node for node in graph.nodes() if graph.degree(node) > 0]
+            if isolated_nodes:
+                # Get all entity names for reference
+                all_entity_names = [e["name"] for e in all_data["entities"]]
 
-                isolated_summary = ", ".join(isolated_nodes[:10])  # Limit to first 10
-                connected_summary = ", ".join(connected_nodes[:10])
+                # Process each isolated entity
+                for isolated_entity in isolated_nodes:
+                    # Find context around this entity in the articles
+                    contexts = find_entity_context(isolated_entity, st.session_state.articles)
 
-                articles_text = "\n\n".join(st.session_state.articles)
+                    if contexts:
+                        # Build context summary
+                        context_summary = "\n\n".join([
+                            f"From Article {ctx['article_idx']}:\n{ctx['context'][:500]}"
+                            for ctx in contexts[:3]  # Limit to 3 contexts
+                        ])
 
-                prompt = f"""Looking at these articles, find connections for isolated entities.
+                        prompt = f"""Analyze the context around the entity "{isolated_entity}" to find relationships.
 
-Isolated entities (need connections): {isolated_summary}
-Connected entities: {connected_summary}
+Entity to connect: {isolated_entity}
 
-Articles:
-{articles_text[:3000]}
+Available entities to connect with:
+{', '.join(all_entity_names[:30])}
 
-Find ANY connections between isolated entities and other entities. Return ONLY JSON:
+Context where "{isolated_entity}" is mentioned:
+{context_summary}
+
+Find ANY relationships between "{isolated_entity}" and other entities based on this context. Return ONLY JSON:
 {{
   "relationships": [
-    {{"source": "Entity A", "target": "Entity B", "type": "relationship_type", "details": "description"}}
+    {{"source": "Entity A", "target": "Entity B", "type": "lobbies|funds|works_for|affiliated_with|mentioned_with|related_to", "details": "description from context"}}
   ]
 }}"""
 
-                try:
-                    response = model.generate_content(prompt)
-                    response_text = response.text.strip()
-                    if response_text.startswith("```json"):
-                        response_text = response_text[7:]
-                    if response_text.startswith("```"):
-                        response_text = response_text[3:]
-                    if response_text.endswith("```"):
-                        response_text = response_text[:-3]
-                    response_text = response_text.strip()
+                        try:
+                            response = model.generate_content(prompt)
+                            response_text = response.text.strip()
+                            if response_text.startswith("```json"):
+                                response_text = response_text[7:]
+                            if response_text.startswith("```"):
+                                response_text = response_text[3:]
+                            if response_text.endswith("```"):
+                                response_text = response_text[:-3]
+                            response_text = response_text.strip()
 
-                    final_connections = json.loads(response_text)
+                            entity_connections = json.loads(response_text)
 
-                    if "relationships" in final_connections:
-                        for rel in final_connections["relationships"]:
-                            if not any(r["source"] == rel["source"] and r["target"] == rel["target"]
-                                      for r in all_data["relationships"]):
-                                all_data["relationships"].append(rel)
+                            if "relationships" in entity_connections:
+                                for rel in entity_connections["relationships"]:
+                                    if not any(r["source"] == rel["source"] and r["target"] == rel["target"]
+                                              for r in all_data["relationships"]):
+                                        all_data["relationships"].append(rel)
 
-                        graph = build_graph(final_connections, graph)
-                except Exception as e:
-                    # If pass 3 fails, just continue with what we have
-                    pass
+                                graph = build_graph(entity_connections, graph)
+                        except Exception as e:
+                            # If this entity fails, continue with next
+                            continue
 
         progress_bar.progress(1.0)
         status_text.empty()
