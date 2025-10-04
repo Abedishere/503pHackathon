@@ -5,6 +5,11 @@ import networkx as nx
 from pyvis.network import Network
 import google.generativeai as genai
 from dotenv import load_dotenv
+import requests
+from bs4 import BeautifulSoup
+import PyPDF2
+from docx import Document
+import io
 
 # Load environment variables
 load_dotenv()
@@ -16,6 +21,9 @@ os.environ['GLOG_minloglevel'] = '2'
 # Initialize Gemini
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-2.0-flash-exp')
+
+# Serper API key
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 
 
 def extract_entities_and_relations(article_text):
@@ -265,6 +273,120 @@ def build_graph(data, existing_graph=None):
     return G
 
 
+def search_articles_serper(query):
+    """Search for articles using Serper API"""
+    url = "https://google.serper.dev/search"
+
+    payload = json.dumps({
+        "q": query,
+        "num": 1  # Only get top 1 result
+    })
+
+    headers = {
+        'X-API-KEY': SERPER_API_KEY,
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        response = requests.post(url, headers=headers, data=payload)
+        response.raise_for_status()
+        results = response.json()
+
+        # Debug: show what keys are in the response
+        st.info(f"API Response keys: {list(results.keys())}")
+
+        articles = []
+
+        # Try 'news' first (if news results exist)
+        if 'news' in results and results['news']:
+            item = results['news'][0]  # Only get first result
+            articles.append({
+                'title': item.get('title', ''),
+                'link': item.get('link', ''),
+                'snippet': item.get('snippet', '')
+            })
+        # Fall back to 'organic' results
+        elif 'organic' in results and results['organic']:
+            item = results['organic'][0]  # Only get first result
+            articles.append({
+                'title': item.get('title', ''),
+                'link': item.get('link', ''),
+                'snippet': item.get('snippet', '')
+            })
+
+        if not articles:
+            st.warning(f"No results found. Full response: {json.dumps(results, indent=2)}")
+
+        return articles
+    except Exception as e:
+        st.error(f"Search error: {str(e)}")
+        import traceback
+        st.error(f"Full error: {traceback.format_exc()}")
+        return []
+
+
+def extract_text_from_file(uploaded_file):
+    """Extract text from uploaded file (PDF, TXT, DOC, DOCX)"""
+    file_extension = uploaded_file.name.split('.')[-1].lower()
+
+    try:
+        if file_extension == 'txt':
+            # Read text file
+            content = uploaded_file.read().decode("utf-8", errors="replace")
+            return content.strip()
+
+        elif file_extension == 'pdf':
+            # Read PDF file
+            pdf_reader = PyPDF2.PdfReader(uploaded_file)
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            return text.strip()
+
+        elif file_extension in ['doc', 'docx']:
+            # Read Word document
+            doc = Document(uploaded_file)
+            text = "\n".join([paragraph.text for paragraph in doc.paragraphs if paragraph.text.strip()])
+            return text.strip()
+
+        else:
+            return f"Unsupported file type: {file_extension}"
+
+    except Exception as e:
+        raise Exception(f"Error extracting text from {file_extension} file: {str(e)}")
+
+
+def fetch_article_content(url):
+    """Fetch article content from URL"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # Remove script and style elements
+        for script in soup(["script", "style", "nav", "footer", "header"]):
+            script.decompose()
+
+        # Get text from paragraphs
+        paragraphs = soup.find_all('p')
+        text = ' '.join([p.get_text().strip() for p in paragraphs if p.get_text().strip()])
+
+        # If no paragraphs found, try to get all text
+        if not text:
+            text = soup.get_text()
+            # Clean up whitespace
+            lines = (line.strip() for line in text.splitlines())
+            text = ' '.join(line for line in lines if line)
+
+        return text[:15000]  # Limit to avoid token limits
+    except Exception as e:
+        return f"Could not fetch content from {url}: {str(e)}"
+
+
 def visualize_graph(graph):
     """Creates interactive visualization with color coding"""
     net = Network(height="750px", width="100%", bgcolor="#1e1e1e", font_color="white")
@@ -339,21 +461,62 @@ with st.sidebar:
         st.session_state.example_loaded = True
 
 # Example article
-example = """Senator Jane Smith received $50,000 in campaign contributions from the pharmaceutical industry's 
-main lobbying group, PhRMA, according to recent FEC filings. The donation came through the firm Akin Gump LLP, 
-which represents PhRMA and other healthcare companies. Smith chairs the Senate Health Committee and has been 
-a vocal supporter of drug pricing legislation favored by the industry. Meanwhile, her chief of staff, 
+example = """Senator Jane Smith received $50,000 in campaign contributions from the pharmaceutical industry's
+main lobbying group, PhRMA, according to recent FEC filings. The donation came through the firm Akin Gump LLP,
+which represents PhRMA and other healthcare companies. Smith chairs the Senate Health Committee and has been
+a vocal supporter of drug pricing legislation favored by the industry. Meanwhile, her chief of staff,
 Robert Johnson, previously worked as a lobbyist for Pfizer before joining Smith's office in 2023."""
-
-# Main input
-st.subheader("📝 Add Articles")
 
 # Initialize session state for articles
 if 'articles' not in st.session_state:
     st.session_state.articles = []
 
+# SEARCH SECTION
+st.subheader("🔍 Search for Article")
+st.markdown("Search for a political connection and automatically fetch the top article")
+
+search_query = st.text_input("Enter your search query (e.g., 'pharmaceutical lobbying congress'):", placeholder="e.g., oil industry lobbying climate policy")
+
+if st.button("🔎 Search & Load Article", type="primary"):
+    if search_query.strip():
+        with st.spinner("🔍 Searching for article..."):
+            search_results = search_articles_serper(search_query)
+
+            if search_results:
+                st.session_state.articles = []  # Clear existing articles
+                progress_text = st.empty()
+
+                result = search_results[0]  # Only one result
+                progress_text.text(f"📰 Fetching article: {result['title'][:50]}...")
+
+                content = fetch_article_content(result['link'])
+
+                # Add title and source to content
+                full_content = f"Title: {result['title']}\nSource: {result['link']}\n\n{content}"
+                st.session_state.articles.append(full_content)
+
+                progress_text.empty()
+                st.success(f"✅ Found and loaded article about '{search_query}'")
+
+                # Show found article
+                with st.expander("📑 Article Found"):
+                    st.markdown(f"**{result['title']}**")
+                    st.markdown(f"🔗 {result['link']}")
+                    st.markdown(f"_{result['snippet']}_")
+
+                st.rerun()
+            else:
+                st.error("No article found. Try a different search query.")
+    else:
+        st.error("Please enter a search query!")
+
+st.markdown("---")
+
+# Main input
+st.subheader("📝 Add Article Manually")
+
 # Article input method
-input_method = st.radio("Input method:", ["Paste text", "Upload files"], horizontal=True)
+input_method = st.radio("Input method:", ["Paste text", "Upload file"], horizontal=True)
 
 if input_method == "Paste text":
     # Use session state to control the text area value
@@ -370,30 +533,40 @@ if input_method == "Paste text":
     with col1:
         if st.button("➕ Add Article"):
             if article_text.strip():
-                st.session_state.articles.append(article_text.strip())
+                st.session_state.articles = [article_text.strip()]  # Replace with single article
                 st.session_state.text_input = ""  # Clear the input
-                st.success(f"✅ Article added successfully! Total: {len(st.session_state.articles)}")
+                st.success(f"✅ Article added successfully!")
                 st.rerun()
             else:
                 st.error("Please paste an article first!")
 
-else:  # Upload files
-    uploaded_files = st.file_uploader(
-        "Upload article files (txt, pdf, or other text files)",
-        type=["txt", "pdf", "doc", "docx"],
-        accept_multiple_files=True
+else:  # Upload file
+    uploaded_file = st.file_uploader(
+        "Upload article file (PDF, TXT, DOC, DOCX - max 3MB)",
+        type=["pdf", "txt", "doc", "docx"],
+        accept_multiple_files=False
     )
 
-    if st.button("➕ Add Uploaded Files"):
-        if uploaded_files:
-            for uploaded_file in uploaded_files:
-                content = uploaded_file.read().decode("utf-8", errors="ignore")
-                if content.strip():
-                    st.session_state.articles.append(content.strip())
-            st.success(f"Added {len(uploaded_files)} articles! Total: {len(st.session_state.articles)}")
-            st.rerun()
+    if st.button("➕ Add Uploaded File"):
+        if uploaded_file:
+            # Check file size (3MB = 3 * 1024 * 1024 bytes)
+            if uploaded_file.size > 3 * 1024 * 1024:
+                st.error("File size exceeds 3MB limit. Please upload a smaller file.")
+            else:
+                try:
+                    # Extract text from file
+                    content = extract_text_from_file(uploaded_file)
+
+                    if content.strip():
+                        st.session_state.articles = [content.strip()]  # Replace with single article
+                        st.success(f"✅ File '{uploaded_file.name}' loaded successfully!")
+                        st.rerun()
+                    else:
+                        st.error("File is empty or no text could be extracted. Please upload a file with content.")
+                except Exception as e:
+                    st.error(f"Error reading file: {str(e)}")
         else:
-            st.error("Please upload files first!")
+            st.error("Please upload a file first!")
 
 # Show current articles
 if st.session_state.articles:
