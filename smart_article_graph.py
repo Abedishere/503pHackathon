@@ -11,6 +11,7 @@ import PyPDF2
 from docx import Document
 import io
 import assemblyai as aai
+import time
 
 # Load environment variables
 load_dotenv()
@@ -279,7 +280,7 @@ def build_graph(data, existing_graph=None):
 
 
 def search_articles_serper(query):
-    """Search for articles using Serper API"""
+    """Search for articles using Serper API with timeout and better error handling"""
     url = "https://google.serper.dev/search"
 
     payload = json.dumps({
@@ -293,12 +294,10 @@ def search_articles_serper(query):
     }
 
     try:
-        response = requests.post(url, headers=headers, data=payload)
+        # Add timeout to prevent hanging
+        response = requests.post(url, headers=headers, data=payload, timeout=15)
         response.raise_for_status()
         results = response.json()
-
-        # Debug: show what keys are in the response
-        st.info(f"API Response keys: {list(results.keys())}")
 
         articles = []
 
@@ -319,14 +318,15 @@ def search_articles_serper(query):
                 'snippet': item.get('snippet', '')
             })
 
-        if not articles:
-            st.warning(f"No results found. Full response: {json.dumps(results, indent=2)}")
-
         return articles
-    except Exception as e:
+    except requests.exceptions.Timeout:
+        st.error("Search timed out. Please try again.")
+        return []
+    except requests.exceptions.RequestException as e:
         st.error(f"Search error: {str(e)}")
-        import traceback
-        st.error(f"Full error: {traceback.format_exc()}")
+        return []
+    except Exception as e:
+        st.error(f"Unexpected search error: {str(e)}")
         return []
 
 
@@ -381,11 +381,12 @@ def transcribe_audio(audio_file):
 
 
 def fetch_article_content(url):
-    """Fetch article content from URL"""
+    """Fetch article content from URL with timeout and better error handling"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
+        # Add timeout to prevent hanging
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
 
@@ -407,6 +408,8 @@ def fetch_article_content(url):
             text = ' '.join(line for line in lines if line)
 
         return text[:15000]  # Limit to avoid token limits
+    except requests.exceptions.Timeout:
+        return "Could not fetch content: Request timed out"
     except Exception as e:
         return f"Could not fetch content from {url}: {str(e)}"
 
@@ -568,23 +571,42 @@ if input_method == "Search article":
     with col1:
         if st.button("🔎 Search & Load Article", type="primary"):
             if search_query.strip():
-                with st.spinner("🔍 Searching for article..."):
+                # Create progress indicators
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                try:
+                    # Step 1: Search for articles
+                    status_text.text("🔍 Searching for articles...")
+                    progress_bar.progress(25)
+                    
                     search_results = search_articles_serper(search_query)
 
                     if search_results:
                         st.session_state.articles = []  # Clear existing articles
-                        progress_text = st.empty()
+
+                        # Step 2: Fetch article content
+                        status_text.text("📰 Fetching article content...")
+                        progress_bar.progress(50)
 
                         result = search_results[0]  # Only one result
-                        progress_text.text(f"📰 Fetching article: {result['title'][:50]}...")
-
+                        
+                        # Add a timeout for content fetching
+                        start_time = time.time()
                         content = fetch_article_content(result['link'])
+                        
+                        # Step 3: Process results
+                        status_text.text("⚙️ Processing article...")
+                        progress_bar.progress(75)
 
                         # Add title and source to content
                         full_content = f"Title: {result['title']}\nSource: {result['link']}\n\n{content}"
                         st.session_state.articles.append(full_content)
 
-                        progress_text.empty()
+                        progress_bar.progress(100)
+                        status_text.empty()
+                        progress_bar.empty()
+
                         st.success(f"✅ Found and loaded article about '{search_query}'")
 
                         # Show found article
@@ -592,10 +614,23 @@ if input_method == "Search article":
                             st.markdown(f"**{result['title']}**")
                             st.markdown(f"🔗 {result['link']}")
                             st.markdown(f"_{result['snippet']}_")
+                            
+                            # Show content preview
+                            if len(content) > 500:
+                                st.markdown(f"**Content Preview:** {content[:500]}...")
+                            else:
+                                st.markdown(f"**Content:** {content}")
 
                         st.rerun()
                     else:
-                        st.error("No article found. Try a different search query.")
+                        progress_bar.empty()
+                        status_text.empty()
+                        st.error("No article found. Try a different search query or use another input method.")
+                except Exception as e:
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.error(f"Search failed: {str(e)}")
+                    st.info("💡 Try using 'Paste text' method instead and search for articles manually.")
             else:
                 st.error("Please enter a search query!")
 
@@ -969,11 +1004,7 @@ If no clear connection exists in the text, return: {{"relationships": []}}"""
                     all_data["entities"] = [e for e in all_data["entities"] if e["name"] not in final_isolated_nodes]
 
                     # Show info or warning based on count
-                    if len(final_isolated_nodes) < 3:
-                        st.info(f"ℹ️ Removed {len(final_isolated_nodes)} floating entities after {additional_iteration} validation attempts: {', '.join(final_isolated_nodes)}")
-                    else:
-                        st.warning(f"⚠️ Removed {len(final_isolated_nodes)} floating entities after {additional_iteration} validation attempts. These entities had no verifiable connections in the text: {', '.join(final_isolated_nodes[:5])}{'...' if len(final_isolated_nodes) > 5 else ''}")
-
+                    
         progress_bar.progress(1.0)
         status_text.empty()
         progress_bar.empty()
@@ -1125,7 +1156,6 @@ if st.session_state.graph_data:
             if i < len(st.session_state.chat_history) - 1:
                 st.markdown("---")
     
-    # Quick analysis buttons
    
 
 elif extract_button and not st.session_state.graph_data:
