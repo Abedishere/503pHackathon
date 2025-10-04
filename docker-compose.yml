@@ -9,6 +9,8 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - SERPER_API_KEY=${SERPER_API_KEY}
       - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
+      - GRPC_VERBOSITY=ERROR
+      - GLOG_minloglevel=2
     volumes:
       - ./data:/app/data
     restart: unless-stopped

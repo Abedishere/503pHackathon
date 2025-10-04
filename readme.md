@@ -1,3 +1,5 @@
+# NOTE: DOCKER DDESNT WORK AS INTENDED JUST PIP INSTALL REQUIREMENTS FILE FOR BEST EXPERIENCE
+# If you want docker to work, press on another input after loading/searching article
 📰 Political Article → Connection Graph
 An AI-powered web application that automatically extracts entities and relationships from political articles to create interactive connection graphs. Built with Streamlit and Google Gemini AI.
 
