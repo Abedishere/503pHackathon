@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  article-graph:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - SERPER_API_KEY=${SERPER_API_KEY}
+      - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

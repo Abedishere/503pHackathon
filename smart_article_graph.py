@@ -369,7 +369,7 @@ def transcribe_audio(audio_file):
 
         # Create transcriber and transcribe
         transcriber = aai.Transcriber(config=config)
-        transcript = transcriber.transscribe(audio_file)
+        transcript = transcriber.transcribe(audio_file)
 
         # Check for errors
         if transcript.status == aai.TranscriptStatus.error:
@@ -459,6 +459,62 @@ def visualize_graph(graph):
     return net
 
 
+def query_graph_data(question, graph_data, articles):
+    """Use LLM to answer questions about the extracted graph data"""
+    
+    # Format the graph data for the prompt
+    entities_text = "\n".join([
+        f"- {entity['name']} ({entity['type']}): {entity.get('description', 'No description')}"
+        for entity in graph_data.get('entities', [])
+    ])
+    
+    relationships_text = "\n".join([
+        f"- {rel['source']} → {rel['target']} ({rel['type']}): {rel.get('details', 'No details')}{' - Amount: ' + rel['amount'] if rel.get('amount') else ''}"
+        for rel in graph_data.get('relationships', [])
+    ])
+    
+    # Get article summaries
+    articles_summary = "\n\n".join([
+        f"Article {i+1} (first 200 chars): {article[:200]}..."
+        for i, article in enumerate(articles)
+    ])
+    
+    prompt = f"""You are an expert analyst for political and lobbying connections. 
+I have extracted the following data from political articles. Please answer the user's question based on this data.
+
+EXTRACTED ENTITIES:
+{entities_text}
+
+EXTRACTED RELATIONSHIPS:
+{relationships_text}
+
+ORIGINAL ARTICLES SUMMARY:
+{articles_summary}
+
+USER QUESTION: {question}
+
+Please provide a comprehensive answer based on the extracted data. If the data doesn't contain enough information to answer fully, say so and make reasonable inferences where appropriate.
+
+Focus on:
+- Political connections and lobbying relationships
+- Financial transactions and amounts
+- Organizational hierarchies and affiliations
+- Potential conflicts of interest
+
+Answer:"""
+
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Error generating response: {str(e)}"
+
+
+# Initialize session state for chat
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+
+
 # ========== STREAMLIT APP ==========
 
 st.set_page_config(page_title="Article → Graph", layout="wide")
@@ -473,6 +529,7 @@ with st.sidebar:
     1. **Paste article** text
     2. **Gemini AI extracts** people, orgs, relationships
     3. **Graph shows** connections
+    4. **Chat** with your data
 
     **Color Key:**
     - 🔴 Person
@@ -651,6 +708,10 @@ if st.session_state.articles:
 else:
     st.info("👆 Add articles using the input method above")
     extract_button = False
+
+# Initialize session state for graph data
+if 'graph_data' not in st.session_state:
+    st.session_state.graph_data = None
 
 # Process articles
 if extract_button and st.session_state.articles:
@@ -917,6 +978,9 @@ If no clear connection exists in the text, return: {{"relationships": []}}"""
         status_text.empty()
         progress_bar.empty()
 
+        # Store graph data in session state for chatbot
+        st.session_state.graph_data = all_data
+
         # Check if we have a valid graph
         if not graph or graph.number_of_nodes() == 0:
             st.error("No entities or connections were found in the articles. Please check the article content and try again.")
@@ -987,3 +1051,82 @@ If no clear connection exists in the text, return: {{"relationships": []}}"""
     except Exception as e:
         st.error(f"Error: {str(e)}")
         st.info("Make sure your Gemini API key is set correctly.")
+
+# CHATBOT SECTION
+if st.session_state.graph_data:
+    st.markdown("---")
+    st.subheader("💬 Chat with Your Graph Data")
+    st.markdown("Ask questions about the entities, relationships, and connections in your graph.")
+    
+    # Suggested questions
+    st.markdown("**💡 Try asking:**")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("Show all politicians"):
+            st.session_state.chat_input = "Show me all the politicians mentioned and their connections"
+    with col2:
+        if st.button("Find financial relationships"):
+            st.session_state.chat_input = "What financial relationships or donations are mentioned?"
+    with col3:
+        if st.button("Identify key organizations"):
+            st.session_state.chat_input = "What are the most connected organizations?"
+    
+    # Chat interface
+    chat_input = st.text_area(
+        "Ask a question about your graph:",
+        placeholder="e.g., Who received the most funding? What are the connections between politicians and companies?",
+        key="chat_input",
+        height=100
+    )
+    
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        if st.button("🚀 Ask", type="primary"):
+            if chat_input.strip():
+                with st.spinner("Analyzing your graph data..."):
+                    # Add user question to chat history
+                    st.session_state.chat_history.append({
+                        "role": "user",
+                        "content": chat_input,
+                        "timestamp": "now"
+                    })
+                    
+                    # Get AI response
+                    response = query_graph_data(
+                        chat_input, 
+                        st.session_state.graph_data, 
+                        st.session_state.articles
+                    )
+                    
+                    # Add AI response to chat history
+                    st.session_state.chat_history.append({
+                        "role": "assistant", 
+                        "content": response,
+                        "timestamp": "now"
+                    })
+                    
+                    st.rerun()
+    
+    with col2:
+        if st.button("🗑️ Clear Chat"):
+            st.session_state.chat_history = []
+            st.rerun()
+    
+    # Display chat history
+    if st.session_state.chat_history:
+        st.markdown("### Conversation History")
+        
+        for i, message in enumerate(st.session_state.chat_history):
+            if message["role"] == "user":
+                st.markdown(f"**🧑 You:** {message['content']}")
+            else:
+                st.markdown(f"**🤖 Analyst:** {message['content']}")
+            
+            if i < len(st.session_state.chat_history) - 1:
+                st.markdown("---")
+    
+    # Quick analysis buttons
+   
+
+elif extract_button and not st.session_state.graph_data:
+    st.info("📊 Generate a graph first to enable the chatbot feature!")
