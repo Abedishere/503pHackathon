@@ -468,15 +468,20 @@ if extract_button and st.session_state.articles:
                 # Update graph with cross-article connections
                 graph = build_graph(cross_connections, graph)
 
-        # PASS 3: Final validation - ensure isolated entities get connected using context
+        # PASS 3: Multi-iteration isolated entity connection (3 iterations)
         if graph and graph.number_of_nodes() > 0:
-            status_text.text(f"🤖 Pass 3: Connecting isolated entities using context analysis...")
-            progress_bar.progress((len(st.session_state.articles) + 1) / (len(st.session_state.articles) + 2))
+            # Run 3 iterations to ensure all entities get connected
+            for iteration in range(1, 4):
+                status_text.text(f"🤖 Pass 3.{iteration}: Connecting isolated entities (iteration {iteration}/3)...")
+                progress_bar.progress((len(st.session_state.articles) + 1) / (len(st.session_state.articles) + 2))
 
-            # Find isolated nodes (entities with no connections)
-            isolated_nodes = [node for node in graph.nodes() if graph.degree(node) == 0]
+                # Find isolated nodes (entities with no connections)
+                isolated_nodes = [node for node in graph.nodes() if graph.degree(node) == 0]
 
-            if isolated_nodes:
+                if not isolated_nodes:
+                    # No more isolated entities, we're done
+                    break
+
                 # Get all entity names for reference
                 all_entity_names = [e["name"] for e in all_data["entities"]]
 
@@ -492,7 +497,30 @@ if extract_button and st.session_state.articles:
                             for ctx in contexts[:3]  # Limit to 3 contexts
                         ])
 
-                        prompt = f"""Analyze the context around the entity "{isolated_entity}" to find relationships.
+                        # On the 3rd iteration, don't allow new entities
+                        if iteration == 3:
+                            prompt = f"""Analyze the context around the entity "{isolated_entity}" to find relationships.
+
+IMPORTANT: Only connect to entities from the existing list below. DO NOT create new entities.
+
+Entity to connect: {isolated_entity}
+
+Available entities to connect with (ONLY use these):
+{', '.join(all_entity_names[:30])}
+
+Context where "{isolated_entity}" is mentioned:
+{context_summary}
+
+Find ANY relationships between "{isolated_entity}" and other entities from the available list. Return ONLY JSON:
+{{
+  "relationships": [
+    {{"source": "Entity A", "target": "Entity B", "type": "lobbies|funds|works_for|affiliated_with|mentioned_with|related_to", "details": "description from context"}}
+  ]
+}}
+
+Remember: Do not introduce any new entities. Only use entities from the available list."""
+                        else:
+                            prompt = f"""Analyze the context around the entity "{isolated_entity}" to find relationships.
 
 Entity to connect: {isolated_entity}
 
@@ -502,8 +530,11 @@ Available entities to connect with:
 Context where "{isolated_entity}" is mentioned:
 {context_summary}
 
-Find ANY relationships between "{isolated_entity}" and other entities based on this context. Return ONLY JSON:
+Find ANY relationships between "{isolated_entity}" and other entities based on this context. You can mention new entities if they appear in the context. Return ONLY JSON:
 {{
+  "entities": [
+    {{"name": "Entity Name", "type": "person|organization|politician|company", "description": "brief context"}}
+  ],
   "relationships": [
     {{"source": "Entity A", "target": "Entity B", "type": "lobbies|funds|works_for|affiliated_with|mentioned_with|related_to", "details": "description from context"}}
   ]
@@ -522,6 +553,13 @@ Find ANY relationships between "{isolated_entity}" and other entities based on t
 
                             entity_connections = json.loads(response_text)
 
+                            # Add new entities (only if not iteration 3)
+                            if iteration < 3 and "entities" in entity_connections:
+                                for entity in entity_connections["entities"]:
+                                    if not any(e["name"] == entity["name"] for e in all_data["entities"]):
+                                        all_data["entities"].append(entity)
+
+                            # Add relationships
                             if "relationships" in entity_connections:
                                 for rel in entity_connections["relationships"]:
                                     if not any(r["source"] == rel["source"] and r["target"] == rel["target"]
@@ -532,6 +570,117 @@ Find ANY relationships between "{isolated_entity}" and other entities based on t
                         except Exception as e:
                             # If this entity fails, continue with next
                             continue
+
+            # FINAL VALIDATION: Keep trying to connect floating nodes until fewer than 3 remain
+            if graph and graph.number_of_nodes() > 0:
+                max_additional_iterations = 10  # Safety limit
+                additional_iteration = 0
+
+                while additional_iteration < max_additional_iterations:
+                    # Find isolated nodes
+                    isolated_nodes = [node for node in graph.nodes() if graph.degree(node) == 0]
+
+                    # Stop if we have fewer than 3 floating nodes (acceptable threshold)
+                    if len(isolated_nodes) < 3:
+                        break
+
+                    additional_iteration += 1
+                    status_text.text(f"🤖 Final validation {additional_iteration}/10: Connecting {len(isolated_nodes)} floating entities...")
+
+                    # Get all entity names for reference
+                    all_entity_names = [e["name"] for e in all_data["entities"]]
+
+                    # Process ALL isolated entities this iteration
+                    connections_made = False
+                    for isolated_entity in isolated_nodes:
+                        # Find ALL contexts around this entity in the articles
+                        contexts = find_entity_context(isolated_entity, st.session_state.articles)
+
+                        if not contexts:
+                            continue
+
+                        # Build FULL context summary - include more context to be thorough
+                        context_summary = "\n\n".join([
+                            f"From Article {ctx['article_idx']}:\n{ctx['context']}"
+                            for ctx in contexts  # Include ALL contexts, not just first 3
+                        ])
+
+                        # Truncate if too long (keep last 3000 chars to stay within limits)
+                        if len(context_summary) > 3000:
+                            context_summary = "..." + context_summary[-3000:]
+
+                        prompt = f"""You are analyzing text to find connections that were previously missed.
+
+Entity needing connections: "{isolated_entity}"
+
+STRICT RULES:
+1. ONLY connect to entities from the existing list below
+2. ONLY mention relationships that are EXPLICITLY stated or CLEARLY implied in the context
+3. DO NOT create new entities
+4. DO NOT make up connections that aren't supported by the text
+5. If no connection exists in the context, return empty relationships array
+
+Available entities (ONLY use these):
+{', '.join(all_entity_names[:50])}
+
+Full context where "{isolated_entity}" appears:
+{context_summary}
+
+Analyze the context carefully. Find ONLY real, text-supported relationships. Return ONLY JSON:
+{{
+  "relationships": [
+    {{"source": "Entity A", "target": "Entity B", "type": "lobbies|funds|works_for|affiliated_with|mentioned_with|related_to", "details": "exact quote or clear reference from context"}}
+  ]
+}}
+
+If no clear connection exists in the text, return: {{"relationships": []}}"""
+
+                        try:
+                            response = model.generate_content(prompt)
+                            response_text = response.text.strip()
+                            if response_text.startswith("```json"):
+                                response_text = response_text[7:]
+                            if response_text.startswith("```"):
+                                response_text = response_text[3:]
+                            if response_text.endswith("```"):
+                                response_text = response_text[:-3]
+                            response_text = response_text.strip()
+
+                            entity_connections = json.loads(response_text)
+
+                            # Add relationships only if they exist
+                            if "relationships" in entity_connections and entity_connections["relationships"]:
+                                connections_made = True
+                                for rel in entity_connections["relationships"]:
+                                    if not any(r["source"] == rel["source"] and r["target"] == rel["target"]
+                                              for r in all_data["relationships"]):
+                                        all_data["relationships"].append(rel)
+
+                                graph = build_graph(entity_connections, graph)
+                        except Exception as e:
+                            # If this entity fails, continue with next
+                            continue
+
+                    # If no connections were made this iteration, break to avoid infinite loop
+                    if not connections_made:
+                        break
+
+                # After all attempts, remove any remaining isolated nodes (should be < 3)
+                final_isolated_nodes = [node for node in graph.nodes() if graph.degree(node) == 0]
+
+                if final_isolated_nodes:
+                    # Remove isolated nodes from graph
+                    for node in final_isolated_nodes:
+                        graph.remove_node(node)
+
+                    # Remove from entities list
+                    all_data["entities"] = [e for e in all_data["entities"] if e["name"] not in final_isolated_nodes]
+
+                    # Show info or warning based on count
+                    if len(final_isolated_nodes) < 3:
+                        st.info(f"ℹ️ Removed {len(final_isolated_nodes)} floating entities after {additional_iteration} validation attempts: {', '.join(final_isolated_nodes)}")
+                    else:
+                        st.warning(f"⚠️ Removed {len(final_isolated_nodes)} floating entities after {additional_iteration} validation attempts. These entities had no verifiable connections in the text: {', '.join(final_isolated_nodes[:5])}{'...' if len(final_isolated_nodes) > 5 else ''}")
 
         progress_bar.progress(1.0)
         status_text.empty()
