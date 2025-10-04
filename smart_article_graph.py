@@ -369,7 +369,7 @@ def transcribe_audio(audio_file):
 
         # Create transcriber and transcribe
         transcriber = aai.Transcriber(config=config)
-        transcript = transcriber.transcribe(audio_file)
+        transcript = transcriber.transscribe(audio_file)
 
         # Check for errors
         if transcript.status == aai.TranscriptStatus.error:
@@ -495,54 +495,54 @@ Robert Johnson, previously worked as a lobbyist for Pfizer before joining Smith'
 if 'articles' not in st.session_state:
     st.session_state.articles = []
 
-# SEARCH SECTION
-st.subheader("🔍 Search for Article")
-st.markdown("Search for a political connection and automatically fetch the top article")
+# Main input section - all input methods together
+st.subheader("📝 Add Article Content")
 
-search_query = st.text_input("Enter your search query (e.g., 'pharmaceutical lobbying congress'):", placeholder="e.g., oil industry lobbying climate policy")
+# Article input method - now includes Search
+input_method = st.radio("Input method:", ["Search article", "Paste text", "Upload file", "Upload audio"], horizontal=True)
 
-if st.button("🔎 Search & Load Article", type="primary"):
-    if search_query.strip():
-        with st.spinner("🔍 Searching for article..."):
-            search_results = search_articles_serper(search_query)
+if input_method == "Search article":
+    st.markdown("Search for a political connection and automatically fetch the top article")
+    
+    search_query = st.text_input("Enter your search query:", 
+                                placeholder="e.g., pharmaceutical lobbying congress, oil industry climate policy")
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("🔎 Search & Load Article", type="primary"):
+            if search_query.strip():
+                with st.spinner("🔍 Searching for article..."):
+                    search_results = search_articles_serper(search_query)
 
-            if search_results:
-                st.session_state.articles = []  # Clear existing articles
-                progress_text = st.empty()
+                    if search_results:
+                        st.session_state.articles = []  # Clear existing articles
+                        progress_text = st.empty()
 
-                result = search_results[0]  # Only one result
-                progress_text.text(f"📰 Fetching article: {result['title'][:50]}...")
+                        result = search_results[0]  # Only one result
+                        progress_text.text(f"📰 Fetching article: {result['title'][:50]}...")
 
-                content = fetch_article_content(result['link'])
+                        content = fetch_article_content(result['link'])
 
-                # Add title and source to content
-                full_content = f"Title: {result['title']}\nSource: {result['link']}\n\n{content}"
-                st.session_state.articles.append(full_content)
+                        # Add title and source to content
+                        full_content = f"Title: {result['title']}\nSource: {result['link']}\n\n{content}"
+                        st.session_state.articles.append(full_content)
 
-                progress_text.empty()
-                st.success(f"✅ Found and loaded article about '{search_query}'")
+                        progress_text.empty()
+                        st.success(f"✅ Found and loaded article about '{search_query}'")
 
-                # Show found article
-                with st.expander("📑 Article Found"):
-                    st.markdown(f"**{result['title']}**")
-                    st.markdown(f"🔗 {result['link']}")
-                    st.markdown(f"_{result['snippet']}_")
+                        # Show found article
+                        with st.expander("📑 Article Found"):
+                            st.markdown(f"**{result['title']}**")
+                            st.markdown(f"🔗 {result['link']}")
+                            st.markdown(f"_{result['snippet']}_")
 
-                st.rerun()
+                        st.rerun()
+                    else:
+                        st.error("No article found. Try a different search query.")
             else:
-                st.error("No article found. Try a different search query.")
-    else:
-        st.error("Please enter a search query!")
+                st.error("Please enter a search query!")
 
-st.markdown("---")
-
-# Main input
-st.subheader("📝 Add Article Manually")
-
-# Article input method
-input_method = st.radio("Input method:", ["Paste text", "Upload file", "Upload audio"], horizontal=True)
-
-if input_method == "Paste text":
+elif input_method == "Paste text":
     # Use session state to control the text area value
     if 'text_input' not in st.session_state:
         st.session_state.text_input = ""
