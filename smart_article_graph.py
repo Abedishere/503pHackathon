@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 import PyPDF2
 from docx import Document
 import io
+import assemblyai as aai
 
 # Load environment variables
 load_dotenv()
@@ -22,8 +23,12 @@ os.environ['GLOG_minloglevel'] = '2'
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-2.0-flash-exp')
 
-# Serper API key
+# API keys
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+
+# Initialize AssemblyAI
+aai.settings.api_key = ASSEMBLYAI_API_KEY
 
 
 def extract_entities_and_relations(article_text):
@@ -356,6 +361,25 @@ def extract_text_from_file(uploaded_file):
         raise Exception(f"Error extracting text from {file_extension} file: {str(e)}")
 
 
+def transcribe_audio(audio_file):
+    """Transcribe audio file to text using AssemblyAI"""
+    try:
+        # Configure transcription
+        config = aai.TranscriptionConfig(speech_model=aai.SpeechModel.universal)
+
+        # Create transcriber and transcribe
+        transcriber = aai.Transcriber(config=config)
+        transcript = transcriber.transcribe(audio_file)
+
+        # Check for errors
+        if transcript.status == aai.TranscriptStatus.error:
+            raise RuntimeError(f"Transcription failed: {transcript.error}")
+
+        return transcript.text
+    except Exception as e:
+        raise Exception(f"Audio transcription error: {str(e)}")
+
+
 def fetch_article_content(url):
     """Fetch article content from URL"""
     try:
@@ -516,7 +540,7 @@ st.markdown("---")
 st.subheader("📝 Add Article Manually")
 
 # Article input method
-input_method = st.radio("Input method:", ["Paste text", "Upload file"], horizontal=True)
+input_method = st.radio("Input method:", ["Paste text", "Upload file", "Upload audio"], horizontal=True)
 
 if input_method == "Paste text":
     # Use session state to control the text area value
@@ -540,7 +564,7 @@ if input_method == "Paste text":
             else:
                 st.error("Please paste an article first!")
 
-else:  # Upload file
+elif input_method == "Upload file":
     uploaded_file = st.file_uploader(
         "Upload article file (PDF, TXT, DOC, DOCX - max 3MB)",
         type=["pdf", "txt", "doc", "docx"],
@@ -567,6 +591,40 @@ else:  # Upload file
                     st.error(f"Error reading file: {str(e)}")
         else:
             st.error("Please upload a file first!")
+
+else:  # Upload audio
+    uploaded_audio = st.file_uploader(
+        "Upload audio file (MP3, WAV, M4A, MP4 - max 3MB)",
+        type=["mp3", "wav", "m4a", "mp4"],
+        accept_multiple_files=False
+    )
+
+    if st.button("🎤 Transcribe & Add Audio"):
+        if uploaded_audio:
+            # Check file size (3MB = 3 * 1024 * 1024 bytes)
+            if uploaded_audio.size > 3 * 1024 * 1024:
+                st.error("File size exceeds 3MB limit. Please upload a smaller file.")
+            else:
+                try:
+                    with st.spinner("🎤 Transcribing audio... This may take a moment."):
+                        # Transcribe audio file
+                        transcript_text = transcribe_audio(uploaded_audio)
+
+                        if transcript_text.strip():
+                            st.session_state.articles = [transcript_text.strip()]  # Replace with transcribed text
+                            st.success(f"✅ Audio '{uploaded_audio.name}' transcribed successfully!")
+
+                            # Show transcribed text preview
+                            with st.expander("📝 Transcribed Text Preview"):
+                                st.text_area("Transcript", value=transcript_text[:500] + "..." if len(transcript_text) > 500 else transcript_text, height=150, disabled=True)
+
+                            st.rerun()
+                        else:
+                            st.error("No speech detected in the audio file. Please upload a different file.")
+                except Exception as e:
+                    st.error(f"Error transcribing audio: {str(e)}")
+        else:
+            st.error("Please upload an audio file first!")
 
 # Show current articles
 if st.session_state.articles:
