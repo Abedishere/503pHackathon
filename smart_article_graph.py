@@ -5,6 +5,12 @@ import networkx as nx
 from pyvis.network import Network
 import google.generativeai as genai
 from dotenv import load_dotenv
+import requests
+from bs4 import BeautifulSoup
+import PyPDF2
+from docx import Document
+import io
+import assemblyai as aai
 
 # Load environment variables
 load_dotenv()
@@ -16,6 +22,13 @@ os.environ['GLOG_minloglevel'] = '2'
 # Initialize Gemini
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-2.0-flash-exp')
+
+# API keys
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+
+# Initialize AssemblyAI
+aai.settings.api_key = ASSEMBLYAI_API_KEY
 
 
 def extract_entities_and_relations(article_text):
@@ -69,6 +82,8 @@ Be comprehensive but accurate. Only include entities and relationships explicitl
 
         return result
     except Exception as e:
+        # Log the error for debugging
+        st.error(f"Entity extraction error: {str(e)}")
         # Return empty structure if parsing fails
         return {"entities": [], "relationships": []}
 
@@ -99,6 +114,32 @@ def split_into_chunks(article_text, num_chunks=5):
             chunks.append(chunk.strip())
 
     return chunks
+
+
+def find_entity_context(entity_name, articles):
+    """Find paragraphs containing the entity and surrounding context"""
+    contexts = []
+
+    for article_idx, article in enumerate(articles):
+        paragraphs = split_into_paragraphs(article)
+
+        for i, paragraph in enumerate(paragraphs):
+            if entity_name.lower() in paragraph.lower():
+                # Get context: previous paragraph + current + next paragraph
+                context_parts = []
+                if i > 0:
+                    context_parts.append(paragraphs[i-1])
+                context_parts.append(paragraph)
+                if i < len(paragraphs) - 1:
+                    context_parts.append(paragraphs[i+1])
+
+                context = " ".join(context_parts)
+                contexts.append({
+                    "article_idx": article_idx + 1,
+                    "context": context
+                })
+
+    return contexts
 
 
 def find_cross_article_connections(all_entities, articles):
@@ -237,6 +278,139 @@ def build_graph(data, existing_graph=None):
     return G
 
 
+def search_articles_serper(query):
+    """Search for articles using Serper API"""
+    url = "https://google.serper.dev/search"
+
+    payload = json.dumps({
+        "q": query,
+        "num": 1  # Only get top 1 result
+    })
+
+    headers = {
+        'X-API-KEY': SERPER_API_KEY,
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        response = requests.post(url, headers=headers, data=payload)
+        response.raise_for_status()
+        results = response.json()
+
+        # Debug: show what keys are in the response
+        st.info(f"API Response keys: {list(results.keys())}")
+
+        articles = []
+
+        # Try 'news' first (if news results exist)
+        if 'news' in results and results['news']:
+            item = results['news'][0]  # Only get first result
+            articles.append({
+                'title': item.get('title', ''),
+                'link': item.get('link', ''),
+                'snippet': item.get('snippet', '')
+            })
+        # Fall back to 'organic' results
+        elif 'organic' in results and results['organic']:
+            item = results['organic'][0]  # Only get first result
+            articles.append({
+                'title': item.get('title', ''),
+                'link': item.get('link', ''),
+                'snippet': item.get('snippet', '')
+            })
+
+        if not articles:
+            st.warning(f"No results found. Full response: {json.dumps(results, indent=2)}")
+
+        return articles
+    except Exception as e:
+        st.error(f"Search error: {str(e)}")
+        import traceback
+        st.error(f"Full error: {traceback.format_exc()}")
+        return []
+
+
+def extract_text_from_file(uploaded_file):
+    """Extract text from uploaded file (PDF, TXT, DOC, DOCX)"""
+    file_extension = uploaded_file.name.split('.')[-1].lower()
+
+    try:
+        if file_extension == 'txt':
+            # Read text file
+            content = uploaded_file.read().decode("utf-8", errors="replace")
+            return content.strip()
+
+        elif file_extension == 'pdf':
+            # Read PDF file
+            pdf_reader = PyPDF2.PdfReader(uploaded_file)
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            return text.strip()
+
+        elif file_extension in ['doc', 'docx']:
+            # Read Word document
+            doc = Document(uploaded_file)
+            text = "\n".join([paragraph.text for paragraph in doc.paragraphs if paragraph.text.strip()])
+            return text.strip()
+
+        else:
+            return f"Unsupported file type: {file_extension}"
+
+    except Exception as e:
+        raise Exception(f"Error extracting text from {file_extension} file: {str(e)}")
+
+
+def transcribe_audio(audio_file):
+    """Transcribe audio file to text using AssemblyAI"""
+    try:
+        # Configure transcription
+        config = aai.TranscriptionConfig(speech_model=aai.SpeechModel.universal)
+
+        # Create transcriber and transcribe
+        transcriber = aai.Transcriber(config=config)
+        transcript = transcriber.transcribe(audio_file)
+
+        # Check for errors
+        if transcript.status == aai.TranscriptStatus.error:
+            raise RuntimeError(f"Transcription failed: {transcript.error}")
+
+        return transcript.text
+    except Exception as e:
+        raise Exception(f"Audio transcription error: {str(e)}")
+
+
+def fetch_article_content(url):
+    """Fetch article content from URL"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # Remove script and style elements
+        for script in soup(["script", "style", "nav", "footer", "header"]):
+            script.decompose()
+
+        # Get text from paragraphs
+        paragraphs = soup.find_all('p')
+        text = ' '.join([p.get_text().strip() for p in paragraphs if p.get_text().strip()])
+
+        # If no paragraphs found, try to get all text
+        if not text:
+            text = soup.get_text()
+            # Clean up whitespace
+            lines = (line.strip() for line in text.splitlines())
+            text = ' '.join(line for line in lines if line)
+
+        return text[:15000]  # Limit to avoid token limits
+    except Exception as e:
+        return f"Could not fetch content from {url}: {str(e)}"
+
+
 def visualize_graph(graph):
     """Creates interactive visualization with color coding"""
     net = Network(height="750px", width="100%", bgcolor="#1e1e1e", font_color="white")
@@ -285,6 +459,62 @@ def visualize_graph(graph):
     return net
 
 
+def query_graph_data(question, graph_data, articles):
+    """Use LLM to answer questions about the extracted graph data"""
+    
+    # Format the graph data for the prompt
+    entities_text = "\n".join([
+        f"- {entity['name']} ({entity['type']}): {entity.get('description', 'No description')}"
+        for entity in graph_data.get('entities', [])
+    ])
+    
+    relationships_text = "\n".join([
+        f"- {rel['source']} → {rel['target']} ({rel['type']}): {rel.get('details', 'No details')}{' - Amount: ' + rel['amount'] if rel.get('amount') else ''}"
+        for rel in graph_data.get('relationships', [])
+    ])
+    
+    # Get article summaries
+    articles_summary = "\n\n".join([
+        f"Article {i+1} (first 200 chars): {article[:200]}..."
+        for i, article in enumerate(articles)
+    ])
+    
+    prompt = f"""You are an expert analyst for political and lobbying connections. 
+I have extracted the following data from political articles. Please answer the user's question based on this data.
+
+EXTRACTED ENTITIES:
+{entities_text}
+
+EXTRACTED RELATIONSHIPS:
+{relationships_text}
+
+ORIGINAL ARTICLES SUMMARY:
+{articles_summary}
+
+USER QUESTION: {question}
+
+Please provide a comprehensive answer based on the extracted data. If the data doesn't contain enough information to answer fully, say so and make reasonable inferences where appropriate.
+
+Focus on:
+- Political connections and lobbying relationships
+- Financial transactions and amounts
+- Organizational hierarchies and affiliations
+- Potential conflicts of interest
+
+Answer:"""
+
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Error generating response: {str(e)}"
+
+
+# Initialize session state for chat
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+
+
 # ========== STREAMLIT APP ==========
 
 st.set_page_config(page_title="Article → Graph", layout="wide")
@@ -299,6 +529,7 @@ with st.sidebar:
     1. **Paste article** text
     2. **Gemini AI extracts** people, orgs, relationships
     3. **Graph shows** connections
+    4. **Chat** with your data
 
     **Color Key:**
     - 🔴 Person
@@ -311,23 +542,64 @@ with st.sidebar:
         st.session_state.example_loaded = True
 
 # Example article
-example = """Senator Jane Smith received $50,000 in campaign contributions from the pharmaceutical industry's 
-main lobbying group, PhRMA, according to recent FEC filings. The donation came through the firm Akin Gump LLP, 
-which represents PhRMA and other healthcare companies. Smith chairs the Senate Health Committee and has been 
-a vocal supporter of drug pricing legislation favored by the industry. Meanwhile, her chief of staff, 
+example = """Senator Jane Smith received $50,000 in campaign contributions from the pharmaceutical industry's
+main lobbying group, PhRMA, according to recent FEC filings. The donation came through the firm Akin Gump LLP,
+which represents PhRMA and other healthcare companies. Smith chairs the Senate Health Committee and has been
+a vocal supporter of drug pricing legislation favored by the industry. Meanwhile, her chief of staff,
 Robert Johnson, previously worked as a lobbyist for Pfizer before joining Smith's office in 2023."""
-
-# Main input
-st.subheader("📝 Add Articles")
 
 # Initialize session state for articles
 if 'articles' not in st.session_state:
     st.session_state.articles = []
 
-# Article input method
-input_method = st.radio("Input method:", ["Paste text", "Upload files"], horizontal=True)
+# Main input section - all input methods together
+st.subheader("📝 Add Article Content")
 
-if input_method == "Paste text":
+# Article input method - now includes Search
+input_method = st.radio("Input method:", ["Search article", "Paste text", "Upload file", "Upload audio"], horizontal=True)
+
+if input_method == "Search article":
+    st.markdown("Search for a political connection and automatically fetch the top article")
+    
+    search_query = st.text_input("Enter your search query:", 
+                                placeholder="e.g., pharmaceutical lobbying congress, oil industry climate policy")
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("🔎 Search & Load Article", type="primary"):
+            if search_query.strip():
+                with st.spinner("🔍 Searching for article..."):
+                    search_results = search_articles_serper(search_query)
+
+                    if search_results:
+                        st.session_state.articles = []  # Clear existing articles
+                        progress_text = st.empty()
+
+                        result = search_results[0]  # Only one result
+                        progress_text.text(f"📰 Fetching article: {result['title'][:50]}...")
+
+                        content = fetch_article_content(result['link'])
+
+                        # Add title and source to content
+                        full_content = f"Title: {result['title']}\nSource: {result['link']}\n\n{content}"
+                        st.session_state.articles.append(full_content)
+
+                        progress_text.empty()
+                        st.success(f"✅ Found and loaded article about '{search_query}'")
+
+                        # Show found article
+                        with st.expander("📑 Article Found"):
+                            st.markdown(f"**{result['title']}**")
+                            st.markdown(f"🔗 {result['link']}")
+                            st.markdown(f"_{result['snippet']}_")
+
+                        st.rerun()
+                    else:
+                        st.error("No article found. Try a different search query.")
+            else:
+                st.error("Please enter a search query!")
+
+elif input_method == "Paste text":
     # Use session state to control the text area value
     if 'text_input' not in st.session_state:
         st.session_state.text_input = ""
@@ -342,30 +614,74 @@ if input_method == "Paste text":
     with col1:
         if st.button("➕ Add Article"):
             if article_text.strip():
-                st.session_state.articles.append(article_text.strip())
+                st.session_state.articles = [article_text.strip()]  # Replace with single article
                 st.session_state.text_input = ""  # Clear the input
-                st.success(f"✅ Article added successfully! Total: {len(st.session_state.articles)}")
+                st.success(f"✅ Article added successfully!")
                 st.rerun()
             else:
                 st.error("Please paste an article first!")
 
-else:  # Upload files
-    uploaded_files = st.file_uploader(
-        "Upload article files (txt, pdf, or other text files)",
-        type=["txt", "pdf", "doc", "docx"],
-        accept_multiple_files=True
+elif input_method == "Upload file":
+    uploaded_file = st.file_uploader(
+        "Upload article file (PDF, TXT, DOC, DOCX - max 3MB)",
+        type=["pdf", "txt", "doc", "docx"],
+        accept_multiple_files=False
     )
 
-    if st.button("➕ Add Uploaded Files"):
-        if uploaded_files:
-            for uploaded_file in uploaded_files:
-                content = uploaded_file.read().decode("utf-8", errors="ignore")
-                if content.strip():
-                    st.session_state.articles.append(content.strip())
-            st.success(f"Added {len(uploaded_files)} articles! Total: {len(st.session_state.articles)}")
-            st.rerun()
+    if st.button("➕ Add Uploaded File"):
+        if uploaded_file:
+            # Check file size (3MB = 3 * 1024 * 1024 bytes)
+            if uploaded_file.size > 3 * 1024 * 1024:
+                st.error("File size exceeds 3MB limit. Please upload a smaller file.")
+            else:
+                try:
+                    # Extract text from file
+                    content = extract_text_from_file(uploaded_file)
+
+                    if content.strip():
+                        st.session_state.articles = [content.strip()]  # Replace with single article
+                        st.success(f"✅ File '{uploaded_file.name}' loaded successfully!")
+                        st.rerun()
+                    else:
+                        st.error("File is empty or no text could be extracted. Please upload a file with content.")
+                except Exception as e:
+                    st.error(f"Error reading file: {str(e)}")
         else:
-            st.error("Please upload files first!")
+            st.error("Please upload a file first!")
+
+else:  # Upload audio
+    uploaded_audio = st.file_uploader(
+        "Upload audio file (MP3, WAV, M4A, MP4 - max 3MB)",
+        type=["mp3", "wav", "m4a", "mp4"],
+        accept_multiple_files=False
+    )
+
+    if st.button("🎤 Transcribe & Add Audio"):
+        if uploaded_audio:
+            # Check file size (3MB = 3 * 1024 * 1024 bytes)
+            if uploaded_audio.size > 3 * 1024 * 1024:
+                st.error("File size exceeds 3MB limit. Please upload a smaller file.")
+            else:
+                try:
+                    with st.spinner("🎤 Transcribing audio... This may take a moment."):
+                        # Transcribe audio file
+                        transcript_text = transcribe_audio(uploaded_audio)
+
+                        if transcript_text.strip():
+                            st.session_state.articles = [transcript_text.strip()]  # Replace with transcribed text
+                            st.success(f"✅ Audio '{uploaded_audio.name}' transcribed successfully!")
+
+                            # Show transcribed text preview
+                            with st.expander("📝 Transcribed Text Preview"):
+                                st.text_area("Transcript", value=transcript_text[:500] + "..." if len(transcript_text) > 500 else transcript_text, height=150, disabled=True)
+
+                            st.rerun()
+                        else:
+                            st.error("No speech detected in the audio file. Please upload a different file.")
+                except Exception as e:
+                    st.error(f"Error transcribing audio: {str(e)}")
+        else:
+            st.error("Please upload an audio file first!")
 
 # Show current articles
 if st.session_state.articles:
@@ -392,6 +708,10 @@ if st.session_state.articles:
 else:
     st.info("👆 Add articles using the input method above")
     extract_button = False
+
+# Initialize session state for graph data
+if 'graph_data' not in st.session_state:
+    st.session_state.graph_data = None
 
 # Process articles
 if extract_button and st.session_state.articles:
@@ -440,65 +760,226 @@ if extract_button and st.session_state.articles:
                 # Update graph with cross-article connections
                 graph = build_graph(cross_connections, graph)
 
-        # PASS 3: Final validation - ensure isolated entities get connected
+        # PASS 3: Multi-iteration isolated entity connection (3 iterations)
         if graph and graph.number_of_nodes() > 0:
-            status_text.text(f"🤖 Pass 3: Validating all entities are connected...")
-            progress_bar.progress((len(st.session_state.articles) + 1) / (len(st.session_state.articles) + 2))
+            # Run 3 iterations to ensure all entities get connected
+            for iteration in range(1, 4):
+                status_text.text(f"🤖 Pass 3.{iteration}: Connecting isolated entities (iteration {iteration}/3)...")
+                progress_bar.progress((len(st.session_state.articles) + 1) / (len(st.session_state.articles) + 2))
 
-            # Find isolated nodes (entities with no connections)
-            isolated_nodes = [node for node in graph.nodes() if graph.degree(node) == 0]
+                # Find isolated nodes (entities with no connections)
+                isolated_nodes = [node for node in graph.nodes() if graph.degree(node) == 0]
 
-            if isolated_nodes and len(isolated_nodes) < len(all_data["entities"]):
-                # Try to connect isolated nodes
-                connected_nodes = [node for node in graph.nodes() if graph.degree(node) > 0]
+                if not isolated_nodes:
+                    # No more isolated entities, we're done
+                    break
 
-                isolated_summary = ", ".join(isolated_nodes[:10])  # Limit to first 10
-                connected_summary = ", ".join(connected_nodes[:10])
+                # Get all entity names for reference
+                all_entity_names = [e["name"] for e in all_data["entities"]]
 
-                articles_text = "\n\n".join(st.session_state.articles)
+                # Process each isolated entity
+                for isolated_entity in isolated_nodes:
+                    # Find context around this entity in the articles
+                    contexts = find_entity_context(isolated_entity, st.session_state.articles)
 
-                prompt = f"""Looking at these articles, find connections for isolated entities.
+                    if contexts:
+                        # Build context summary
+                        context_summary = "\n\n".join([
+                            f"From Article {ctx['article_idx']}:\n{ctx['context'][:500]}"
+                            for ctx in contexts[:3]  # Limit to 3 contexts
+                        ])
 
-Isolated entities (need connections): {isolated_summary}
-Connected entities: {connected_summary}
+                        # On the 3rd iteration, don't allow new entities
+                        if iteration == 3:
+                            prompt = f"""Analyze the context around the entity "{isolated_entity}" to find relationships.
 
-Articles:
-{articles_text[:3000]}
+IMPORTANT: Only connect to entities from the existing list below. DO NOT create new entities.
 
-Find ANY connections between isolated entities and other entities. Return ONLY JSON:
+Entity to connect: {isolated_entity}
+
+Available entities to connect with (ONLY use these):
+{', '.join(all_entity_names[:30])}
+
+Context where "{isolated_entity}" is mentioned:
+{context_summary}
+
+Find ANY relationships between "{isolated_entity}" and other entities from the available list. Return ONLY JSON:
 {{
   "relationships": [
-    {{"source": "Entity A", "target": "Entity B", "type": "relationship_type", "details": "description"}}
+    {{"source": "Entity A", "target": "Entity B", "type": "lobbies|funds|works_for|affiliated_with|mentioned_with|related_to", "details": "description from context"}}
+  ]
+}}
+
+Remember: Do not introduce any new entities. Only use entities from the available list."""
+                        else:
+                            prompt = f"""Analyze the context around the entity "{isolated_entity}" to find relationships.
+
+Entity to connect: {isolated_entity}
+
+Available entities to connect with:
+{', '.join(all_entity_names[:30])}
+
+Context where "{isolated_entity}" is mentioned:
+{context_summary}
+
+Find ANY relationships between "{isolated_entity}" and other entities based on this context. You can mention new entities if they appear in the context. Return ONLY JSON:
+{{
+  "entities": [
+    {{"name": "Entity Name", "type": "person|organization|politician|company", "description": "brief context"}}
+  ],
+  "relationships": [
+    {{"source": "Entity A", "target": "Entity B", "type": "lobbies|funds|works_for|affiliated_with|mentioned_with|related_to", "details": "description from context"}}
   ]
 }}"""
 
-                try:
-                    response = model.generate_content(prompt)
-                    response_text = response.text.strip()
-                    if response_text.startswith("```json"):
-                        response_text = response_text[7:]
-                    if response_text.startswith("```"):
-                        response_text = response_text[3:]
-                    if response_text.endswith("```"):
-                        response_text = response_text[:-3]
-                    response_text = response_text.strip()
+                        try:
+                            response = model.generate_content(prompt)
+                            response_text = response.text.strip()
+                            if response_text.startswith("```json"):
+                                response_text = response_text[7:]
+                            if response_text.startswith("```"):
+                                response_text = response_text[3:]
+                            if response_text.endswith("```"):
+                                response_text = response_text[:-3]
+                            response_text = response_text.strip()
 
-                    final_connections = json.loads(response_text)
+                            entity_connections = json.loads(response_text)
 
-                    if "relationships" in final_connections:
-                        for rel in final_connections["relationships"]:
-                            if not any(r["source"] == rel["source"] and r["target"] == rel["target"]
-                                      for r in all_data["relationships"]):
-                                all_data["relationships"].append(rel)
+                            # Add new entities (only if not iteration 3)
+                            if iteration < 3 and "entities" in entity_connections:
+                                for entity in entity_connections["entities"]:
+                                    if not any(e["name"] == entity["name"] for e in all_data["entities"]):
+                                        all_data["entities"].append(entity)
 
-                        graph = build_graph(final_connections, graph)
-                except Exception as e:
-                    # If pass 3 fails, just continue with what we have
-                    pass
+                            # Add relationships
+                            if "relationships" in entity_connections:
+                                for rel in entity_connections["relationships"]:
+                                    if not any(r["source"] == rel["source"] and r["target"] == rel["target"]
+                                              for r in all_data["relationships"]):
+                                        all_data["relationships"].append(rel)
+
+                                graph = build_graph(entity_connections, graph)
+                        except Exception as e:
+                            # If this entity fails, continue with next
+                            continue
+
+            # FINAL VALIDATION: Keep trying to connect floating nodes until fewer than 3 remain
+            if graph and graph.number_of_nodes() > 0:
+                max_additional_iterations = 10  # Safety limit
+                additional_iteration = 0
+
+                while additional_iteration < max_additional_iterations:
+                    # Find isolated nodes
+                    isolated_nodes = [node for node in graph.nodes() if graph.degree(node) == 0]
+
+                    # Stop if we have fewer than 3 floating nodes (acceptable threshold)
+                    if len(isolated_nodes) < 3:
+                        break
+
+                    additional_iteration += 1
+                    status_text.text(f"🤖 Final validation {additional_iteration}/10: Connecting {len(isolated_nodes)} floating entities...")
+
+                    # Get all entity names for reference
+                    all_entity_names = [e["name"] for e in all_data["entities"]]
+
+                    # Process ALL isolated entities this iteration
+                    connections_made = False
+                    for isolated_entity in isolated_nodes:
+                        # Find ALL contexts around this entity in the articles
+                        contexts = find_entity_context(isolated_entity, st.session_state.articles)
+
+                        if not contexts:
+                            continue
+
+                        # Build FULL context summary - include more context to be thorough
+                        context_summary = "\n\n".join([
+                            f"From Article {ctx['article_idx']}:\n{ctx['context']}"
+                            for ctx in contexts  # Include ALL contexts, not just first 3
+                        ])
+
+                        # Truncate if too long (keep last 3000 chars to stay within limits)
+                        if len(context_summary) > 3000:
+                            context_summary = "..." + context_summary[-3000:]
+
+                        prompt = f"""You are analyzing text to find connections that were previously missed.
+
+Entity needing connections: "{isolated_entity}"
+
+STRICT RULES:
+1. ONLY connect to entities from the existing list below
+2. ONLY mention relationships that are EXPLICITLY stated or CLEARLY implied in the context
+3. DO NOT create new entities
+4. DO NOT make up connections that aren't supported by the text
+5. If no connection exists in the context, return empty relationships array
+
+Available entities (ONLY use these):
+{', '.join(all_entity_names[:50])}
+
+Full context where "{isolated_entity}" appears:
+{context_summary}
+
+Analyze the context carefully. Find ONLY real, text-supported relationships. Return ONLY JSON:
+{{
+  "relationships": [
+    {{"source": "Entity A", "target": "Entity B", "type": "lobbies|funds|works_for|affiliated_with|mentioned_with|related_to", "details": "exact quote or clear reference from context"}}
+  ]
+}}
+
+If no clear connection exists in the text, return: {{"relationships": []}}"""
+
+                        try:
+                            response = model.generate_content(prompt)
+                            response_text = response.text.strip()
+                            if response_text.startswith("```json"):
+                                response_text = response_text[7:]
+                            if response_text.startswith("```"):
+                                response_text = response_text[3:]
+                            if response_text.endswith("```"):
+                                response_text = response_text[:-3]
+                            response_text = response_text.strip()
+
+                            entity_connections = json.loads(response_text)
+
+                            # Add relationships only if they exist
+                            if "relationships" in entity_connections and entity_connections["relationships"]:
+                                connections_made = True
+                                for rel in entity_connections["relationships"]:
+                                    if not any(r["source"] == rel["source"] and r["target"] == rel["target"]
+                                              for r in all_data["relationships"]):
+                                        all_data["relationships"].append(rel)
+
+                                graph = build_graph(entity_connections, graph)
+                        except Exception as e:
+                            # If this entity fails, continue with next
+                            continue
+
+                    # If no connections were made this iteration, break to avoid infinite loop
+                    if not connections_made:
+                        break
+
+                # After all attempts, remove any remaining isolated nodes (should be < 3)
+                final_isolated_nodes = [node for node in graph.nodes() if graph.degree(node) == 0]
+
+                if final_isolated_nodes:
+                    # Remove isolated nodes from graph
+                    for node in final_isolated_nodes:
+                        graph.remove_node(node)
+
+                    # Remove from entities list
+                    all_data["entities"] = [e for e in all_data["entities"] if e["name"] not in final_isolated_nodes]
+
+                    # Show info or warning based on count
+                    if len(final_isolated_nodes) < 3:
+                        st.info(f"ℹ️ Removed {len(final_isolated_nodes)} floating entities after {additional_iteration} validation attempts: {', '.join(final_isolated_nodes)}")
+                    else:
+                        st.warning(f"⚠️ Removed {len(final_isolated_nodes)} floating entities after {additional_iteration} validation attempts. These entities had no verifiable connections in the text: {', '.join(final_isolated_nodes[:5])}{'...' if len(final_isolated_nodes) > 5 else ''}")
 
         progress_bar.progress(1.0)
         status_text.empty()
         progress_bar.empty()
+
+        # Store graph data in session state for chatbot
+        st.session_state.graph_data = all_data
 
         # Check if we have a valid graph
         if not graph or graph.number_of_nodes() == 0:
@@ -570,3 +1051,82 @@ Find ANY connections between isolated entities and other entities. Return ONLY J
     except Exception as e:
         st.error(f"Error: {str(e)}")
         st.info("Make sure your Gemini API key is set correctly.")
+
+# CHATBOT SECTION
+if st.session_state.graph_data:
+    st.markdown("---")
+    st.subheader("💬 Chat with Your Graph Data")
+    st.markdown("Ask questions about the entities, relationships, and connections in your graph.")
+    
+    # Suggested questions
+    st.markdown("**💡 Try asking:**")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("Show all politicians"):
+            st.session_state.chat_input = "Show me all the politicians mentioned and their connections"
+    with col2:
+        if st.button("Find financial relationships"):
+            st.session_state.chat_input = "What financial relationships or donations are mentioned?"
+    with col3:
+        if st.button("Identify key organizations"):
+            st.session_state.chat_input = "What are the most connected organizations?"
+    
+    # Chat interface
+    chat_input = st.text_area(
+        "Ask a question about your graph:",
+        placeholder="e.g., Who received the most funding? What are the connections between politicians and companies?",
+        key="chat_input",
+        height=100
+    )
+    
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        if st.button("🚀 Ask", type="primary"):
+            if chat_input.strip():
+                with st.spinner("Analyzing your graph data..."):
+                    # Add user question to chat history
+                    st.session_state.chat_history.append({
+                        "role": "user",
+                        "content": chat_input,
+                        "timestamp": "now"
+                    })
+                    
+                    # Get AI response
+                    response = query_graph_data(
+                        chat_input, 
+                        st.session_state.graph_data, 
+                        st.session_state.articles
+                    )
+                    
+                    # Add AI response to chat history
+                    st.session_state.chat_history.append({
+                        "role": "assistant", 
+                        "content": response,
+                        "timestamp": "now"
+                    })
+                    
+                    st.rerun()
+    
+    with col2:
+        if st.button("🗑️ Clear Chat"):
+            st.session_state.chat_history = []
+            st.rerun()
+    
+    # Display chat history
+    if st.session_state.chat_history:
+        st.markdown("### Conversation History")
+        
+        for i, message in enumerate(st.session_state.chat_history):
+            if message["role"] == "user":
+                st.markdown(f"**🧑 You:** {message['content']}")
+            else:
+                st.markdown(f"**🤖 Analyst:** {message['content']}")
+            
+            if i < len(st.session_state.chat_history) - 1:
+                st.markdown("---")
+    
+    # Quick analysis buttons
+   
+
+elif extract_button and not st.session_state.graph_data:
+    st.info("📊 Generate a graph first to enable the chatbot feature!")
